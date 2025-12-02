@@ -6,4 +6,5 @@ Everything here is code that I use myself and keep updated when possible.
 
 ## Contact and community
 For business inquiries or custom work, you can find me on [vLounge](https://discord.gg/NxpbJUQGa5).
+
 You can also join my development community ---> [DL: Dev Lounge](https://discord.gg/gY2hneqBVT)
