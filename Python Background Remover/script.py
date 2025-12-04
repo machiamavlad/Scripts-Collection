@@ -31,11 +31,10 @@ SHADOW_ANGLE = 30
 SHADOW_DISTANCE = 7
 SHADOW_SIZE = 30
 
-EDGE_BLUR_ENABLED = False
-EDGE_BLUR_RADIUS = 1.0
+EDGE_BLUR = False
+EDGE_BLUR_RADIUS = 1.5
 
-USE_GPU = False
-HAS_CUDA = False
+GPU_ENABLED = False
 
 CPU_SAMPLES = []
 RAM_SAMPLES = []
@@ -55,34 +54,6 @@ COLOR_MAIN = "\033[33m"
 COLOR_CPU = "\033[31m"
 COLOR_RAM = "\033[36m"
 COLOR_GPU = "\033[35m"
-
-ERRORS = []
-
-
-def init_gpu():
-    global HAS_CUDA, GPU_TOTAL_MB
-    if not hasattr(cv2, "cuda"):
-        HAS_CUDA = False
-        return
-    try:
-        count = cv2.cuda.getCudaEnabledDeviceCount()
-    except Exception:
-        HAS_CUDA = False
-        return
-    if count <= 0:
-        HAS_CUDA = False
-        return
-    HAS_CUDA = True
-    if shutil.which("nvidia-smi"):
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                stderr=subprocess.DEVNULL
-            )
-            first_line = out.decode().strip().split("\n")[0]
-            GPU_TOTAL_MB = int(first_line.strip())
-        except Exception:
-            GPU_TOTAL_MB = None
 
 
 def gpu_usage_value():
@@ -138,10 +109,6 @@ def print_usage_summary():
         print(f" Average GPU VRAM: {avg_gpu:.0f} MB")
     else:
         print(" Average GPU VRAM: no data (nvidia-smi not available)")
-    if ERRORS:
-        print("\nFiles with errors:")
-        for name, msg in ERRORS:
-            print(f" - {name}: {msg}")
 
 
 def build_bar(label, frac, length, color, suffix=""):
@@ -232,7 +199,7 @@ def bgr_to_hex(bgr: np.ndarray) -> str:
     return "#{:02X}{:02X}{:02X}".format(r, g, b)
 
 
-def build_alpha_from_color_cpu(bgr):
+def build_alpha_from_color(bgr):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     if BG_HSV is None:
         bg_hsv = cv2.cvtColor(BG_BGR.reshape(1, 1, 3), cv2.COLOR_BGR2HSV)[0, 0]
@@ -252,45 +219,6 @@ def build_alpha_from_color_cpu(bgr):
     return alpha
 
 
-def build_alpha_from_color_gpu(bgr):
-    if not HAS_CUDA:
-        return build_alpha_from_color_cpu(bgr)
-    gpu_bgr = cv2.cuda_GpuMat()
-    gpu_bgr.upload(bgr)
-    gpu_hsv = cv2.cuda.cvtColor(gpu_bgr, cv2.COLOR_BGR2HSV)
-    if BG_HSV is None:
-        bg_hsv = cv2.cvtColor(BG_BGR.reshape(1, 1, 3), cv2.COLOR_BGR2HSV)[0, 0]
-    else:
-        bg_hsv = BG_HSV
-    h_bg, s_bg, v_bg = [int(x) for x in bg_hsv]
-    h_tol = int(8 + BG_TOL * 0.3)
-    h_tol = max(5, min(30, h_tol))
-    s_min = max(60, int(s_bg * 0.5))
-    v_min = max(60, int(v_bg * 0.5))
-    lower = np.array([max(0, h_bg - h_tol), s_min, v_min], dtype=np.uint8)
-    upper = np.array([min(179, h_bg + h_tol), 255, 255], dtype=np.uint8)
-    gpu_lower = cv2.cuda_GpuMat()
-    gpu_upper = cv2.cuda_GpuMat()
-    gpu_lower.upload(lower.reshape(1, 1, 3))
-    gpu_upper.upload(upper.reshape(1, 1, 3))
-    bg_mask_gpu = cv2.cuda.inRange(gpu_hsv, gpu_lower, gpu_upper)
-    kernel = np.ones((3, 3), np.uint8)
-    morph = cv2.cuda.createMorphologyFilter(cv2.MORPH_DILATE, bg_mask_gpu.type(), kernel)
-    bg_mask_gpu = morph.apply(bg_mask_gpu)
-    bg_mask = bg_mask_gpu.download()
-    alpha = 255 - bg_mask
-    return alpha
-
-
-def build_alpha_from_color(bgr):
-    if USE_GPU and HAS_CUDA:
-        try:
-            return build_alpha_from_color_gpu(bgr)
-        except Exception:
-            return build_alpha_from_color_cpu(bgr)
-    return build_alpha_from_color_cpu(bgr)
-
-
 def feather_alpha(alpha, radius):
     if radius <= 0:
         return alpha
@@ -307,22 +235,18 @@ def crop_subject(alpha):
     y1, y2 = ys.min(), ys.max()
     h, w = alpha.shape
     pad = int(max(w, h) * PAD_RATIO)
-    x0 = max(0, x1 - pad)
-    y0 = max(0, y1 - pad)
-    x2p = min(w - 1, x2 + pad)
-    y2p = min(h - 1, y2 + pad)
-    return x0, y0, x2p - x0 + 1, y2p - y0 + 1
+    return (
+        max(0, x1 - pad),
+        max(0, y1 - pad),
+        min(w - 1, x2 + pad) - (x1 - pad) + 1,
+        min(h - 1, y2 + pad) - (y1 - pad) + 1
+    )
 
 
 def resize_center_square(rgba, size):
     h, w = rgba.shape[:2]
-    if h == 0 or w == 0:
-        return np.zeros((size, size, 4), dtype=np.uint8)
     s = min(size / w, size / h) * SCALE_FACTOR
-    nw = int(math.ceil(w * s))
-    nh = int(math.ceil(h * s))
-    nw = max(1, min(size, nw))
-    nh = max(1, min(size, nh))
+    nw, nh = int(math.ceil(w * s)), int(math.ceil(h * s))
     resized = cv2.resize(rgba, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
     canvas = np.zeros((size, size, 4), dtype=np.uint8)
     x = (size - nw) // 2
@@ -356,25 +280,29 @@ def add_drop_shadow(bgra):
     return result
 
 
-def apply_edge_blur(bgr, alpha):
-    edges = cv2.Canny(alpha, 50, 150)
-    kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
-    edges = cv2.GaussianBlur(edges, (3, 3), 0)
-    mask = edges.astype(np.float32) / 255.0
-    if mask.max() == 0:
-        return bgr
-    blurred = cv2.GaussianBlur(bgr, (5, 5), EDGE_BLUR_RADIUS)
-    mask3 = mask[..., None]
-    out = blurred.astype(np.float32) * mask3 + bgr.astype(np.float32) * (1.0 - mask3)
-    return np.clip(out, 0, 255).astype(np.uint8)
+def apply_edge_blur(bgra, radius):
+    if radius <= 0:
+        return bgra
+    bgr = bgra[:, :, :3]
+    alpha = bgra[:, :, 3]
+    k = int(max(1, round(radius * 2 + 1)))
+    alpha_blur = cv2.GaussianBlur(alpha, (k | 1, k | 1), radius)
+    edge_mask = ((alpha_blur > 0) & (alpha_blur < 255)).astype(np.uint8) * 255
+    if not np.any(edge_mask):
+        return bgra
+    bgr_blur = cv2.GaussianBlur(bgr, (k | 1, k | 1), radius)
+    m = edge_mask.astype(np.float32) / 255.0
+    m3 = m[..., None]
+    out_bgr = bgr.astype(np.float32) * (1.0 - m3) + bgr_blur.astype(np.float32) * m3
+    out_bgr = np.clip(out_bgr, 0, 255).astype(np.uint8)
+    return np.dstack([out_bgr, alpha])
 
 
 def process_one(p: Path, out_dir: Path):
     sample_usage()
     bgr = read_image(p)
     if bgr is None:
-        return False
+        return False, "unsupported format or read error"
     alpha_raw = build_alpha_from_color(bgr)
     fg_mask = (alpha_raw > 0).astype(np.uint8) * 255
     kernel = np.ones((3, 3), np.uint8)
@@ -393,29 +321,30 @@ def process_one(p: Path, out_dir: Path):
         bgr_fixed = cv2.inpaint(bgr_c, spill_mask, 3, cv2.INPAINT_TELEA)
     else:
         bgr_fixed = bgr_c
-
-    if EDGE_BLUR_ENABLED:
-        bgr_post = apply_edge_blur(bgr_fixed, alpha_c)
-    else:
-        bgr_post = bgr_fixed
-
-    bgra = np.dstack([bgr_post, alpha_c])
-
-    if APPLY_SHADOW:
-        bgra = add_drop_shadow(bgra)
-
+    bgra = np.dstack([bgr_fixed, alpha_c])
     out = resize_center_square(bgra, TARGET_SIZE)
+    if EDGE_BLUR:
+        out = apply_edge_blur(out, EDGE_BLUR_RADIUS)
+        if APPLY_SHADOW:
+            out = add_drop_shadow(out)
+    else:
+        if APPLY_SHADOW:
+            out = add_drop_shadow(out)
     out_rgba = cv2.cvtColor(out, cv2.COLOR_BGRA2RGBA)
     out_path = out_dir / (p.stem + ".png")
-    Image.fromarray(out_rgba).save(out_path, "PNG", compress_level=9)
-    return True
+    try:
+        Image.fromarray(out_rgba).save(out_path, "PNG", compress_level=9)
+    except Exception as e:
+        return False, str(e)
+    return True, None
 
 
 def interactive_setup():
-    global INPUT_DIR, OUTPUT_DIR, BG_BGR, BG_HSV, TARGET_SIZE, APPLY_SHADOW, BG_TOL, FEATHER, SCALE_FACTOR, EDGE_BLUR_ENABLED, EDGE_BLUR_RADIUS, USE_GPU
+    global INPUT_DIR, OUTPUT_DIR, BG_BGR, BG_HSV, TARGET_SIZE, APPLY_SHADOW, BG_TOL, FEATHER, SCALE_FACTOR, EDGE_BLUR, EDGE_BLUR_RADIUS, GPU_ENABLED
+
     print("=== Background Remover ===")
-    print("Simple solid-color background removal,")
-    print("with centering, optional drop shadow and resource stats.\n")
+    print("Solid-color background removal with centering, stats and options.\n")
+
     default_input = "files"
     default_output = "exports"
     default_color = "#336699"
@@ -423,70 +352,74 @@ def interactive_setup():
     default_tol = 2.0
     default_feather = 2.0
     default_scale = 0.9
+
     inp = input(f"Input folder with renders [{default_input}]: ").strip()
     if not inp:
         inp = default_input
     INPUT_DIR = Path(inp)
+
     out = input(f"Output folder for PNG icons [{default_output}]: ").strip()
     if not out:
         out = default_output
     OUTPUT_DIR = Path(out)
+
     size_str = input(f"Icon size (square, px) [{default_size}]: ").strip()
     if size_str.isdigit():
         TARGET_SIZE = int(size_str)
     else:
         TARGET_SIZE = default_size
+
     while True:
         c = input(f"Background color to remove [{default_color}]: ").strip()
         if not c:
             c = default_color
         try:
-            bg = parse_color_flexible(c)
-            BG_BGR[:] = bg
+            BG = parse_color_flexible(c)
+            BG_BGR[:] = BG
             BG_HSV = cv2.cvtColor(BG_BGR.reshape(1, 1, 3), cv2.COLOR_BGR2HSV)[0, 0]
             break
         except ValueError as e:
             print(f"  Invalid color: {e}")
             print("  Accepted formats: #RRGGBB, rgb(r g b), r g b, r,g,b")
-    tol_str = input(f"Color tolerance (0-50) [{default_tol}]: ").strip()
+
+    tol_str = input(f"Color tolerance (0–50) [{default_tol}]: ").strip()
     try:
         BG_TOL = float(tol_str) if tol_str else default_tol
     except ValueError:
         BG_TOL = default_tol
-    feather_str = input(f"Feather radius for edges (0-10) [{default_feather}]: ").strip()
+
+    feather_str = input(f"Feather radius for edges (0–10) [{default_feather}]: ").strip()
     try:
         FEATHER = float(feather_str) if feather_str else default_feather
     except ValueError:
         FEATHER = default_feather
-    scale_str = input(f"Object scale inside icon (0.5-1.0) [{default_scale}]: ").strip()
+
+    scale_str = input(f"Object scale inside icon (0.5–1.0) [{default_scale}]: ").strip()
     try:
         SCALE_FACTOR = float(scale_str) if scale_str else default_scale
     except ValueError:
         SCALE_FACTOR = default_scale
     SCALE_FACTOR = max(0.5, min(1.0, SCALE_FACTOR))
+
     shadow_ans = input("Add drop shadow (Photoshop style)? [Y/n]: ").strip().lower()
     APPLY_SHADOW = (shadow_ans == "" or shadow_ans.startswith("y"))
-    edge_ans = input("Apply subtle edge blur? [y/N]: ").strip().lower()
-    EDGE_BLUR_ENABLED = edge_ans.startswith("y")
-    if EDGE_BLUR_ENABLED:
-        radius_str = input(f"Edge blur strength (0.5-3.0) [{EDGE_BLUR_RADIUS}]: ").strip()
+
+    blur_ans = input("Apply subtle edge blur on object edges? [y/N]: ").strip().lower()
+    EDGE_BLUR = blur_ans.startswith("y")
+    if EDGE_BLUR:
+        blur_r = input(" Edge blur radius (0.5–3.0) [1.5]: ").strip()
         try:
-            EDGE_BLUR_RADIUS = float(radius_str) if radius_str else EDGE_BLUR_RADIUS
+            EDGE_BLUR_RADIUS = float(blur_r) if blur_r else 1.5
         except ValueError:
-            EDGE_BLUR_RADIUS = 1.0
-        EDGE_BLUR_RADIUS = max(0.5, min(3.0, EDGE_BLUR_RADIUS))
-    gpu_ans = input("Use GPU acceleration if available? [y/N]: ").strip().lower()
-    if gpu_ans.startswith("y"):
-        init_gpu()
-        USE_GPU = HAS_CUDA
-        if USE_GPU:
-            print("GPU acceleration enabled (if OpenCV CUDA is available).")
-        else:
-            print("GPU acceleration not available in this OpenCV build. Using CPU.")
-    else:
-        USE_GPU = False
+            EDGE_BLUR_RADIUS = 1.5
+        EDGE_BLUR_RADIUS = max(0.5, min(5.0, EDGE_BLUR_RADIUS))
+
+    gpu_ans = input("Use GPU acceleration where available? [y/N]: ").strip().lower()
+    GPU_ENABLED = gpu_ans.startswith("y")
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     print("\n=== Final configuration ===")
     print(f" Input folder : {INPUT_DIR.resolve()}")
     print(f" Output folder: {OUTPUT_DIR.resolve()}")
@@ -496,36 +429,74 @@ def interactive_setup():
     print(f" Feather      : {FEATHER}")
     print(f" Scale factor : {SCALE_FACTOR}")
     print(f" Drop shadow  : {'ON' if APPLY_SHADOW else 'OFF'}")
-    print(f" Edge blur    : {'ON' if EDGE_BLUR_ENABLED else 'OFF'}")
-    print(f" GPU usage    : {'ON' if USE_GPU else 'OFF'}\n")
+    print(f" Edge blur    : {'ON' if EDGE_BLUR else 'OFF'}")
+    print(f" GPU usage    : {'ON' if GPU_ENABLED else 'OFF'}\n")
+
     confirm = input("Proceed with these settings? [Y/n]: ").strip().lower()
     if confirm.startswith("n"):
         print("Cancelled by user.")
         sys.exit(0)
 
 
+def notify_done(ok, fail, errors):
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        if fail == 0:
+            msg = f"Background Remover finished.\n\nProcessed {ok} file(s) with no errors."
+            icon = 0x40
+        else:
+            msg = f"Background Remover finished.\n\nProcessed {ok} file(s), {fail} failed."
+            if errors:
+                n, m = errors[0]
+                msg += f"\n\nFirst error:\n{n}: {m[:160]}"
+            icon = 0x30
+        ctypes.windll.user32.MessageBoxW(0, msg, "Background Remover", icon)
+    except Exception:
+        pass
+
+
 def main():
     interactive_setup()
+
     files = [p for p in INPUT_DIR.iterdir() if p.is_file()]
     total = len(files)
-    ok, fail = 0, 0
+    ok = 0
+    fail = 0
+    errors = []
+
     if not files:
         print("\nNo files found in input folder. Nothing to do.")
         return
+
     print(f"\nStarting processing of {total} file(s)...")
+
     for i, p in enumerate(files, start=1):
+        success = False
+        err_msg = None
         try:
-            if process_one(p, OUTPUT_DIR):
-                ok += 1
-            else:
-                fail += 1
+            success, err_msg = process_one(p, OUTPUT_DIR)
         except Exception as e:
-            ERRORS.append((p.name, str(e)))
+            success = False
+            err_msg = str(e)
+        if success:
+            ok += 1
+        else:
             fail += 1
+            errors.append((p.name, err_msg or "unknown error"))
         print_progress(i, total)
+
     print()
     print(f"Done: processed {ok}, failed {fail} -> {OUTPUT_DIR.resolve()}")
     print_usage_summary()
+
+    if errors:
+        print("\nFiles with errors:")
+        for name, msg in errors:
+            print(f" - {name}: {msg}")
+
+    notify_done(ok, fail, errors)
 
 
 if __name__ == "__main__":
